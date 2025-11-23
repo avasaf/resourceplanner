@@ -1,11 +1,68 @@
 import sqlite3
-from datetime import datetime, date
+from datetime import date, datetime
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 DB_PATH = "schedule.db"
+
+# ---------- Styling ----------
+
+# Core brand tones provided by the design guide
+PALETTE = {
+    "primary": "#0B1E41",  # Quantum Blue
+    "background": "#FFFFFF",  # Infinity White
+    "accent": "#64A6D9",  # Inspired by Motion tones
+    "muted": "#C6DEB3",  # Inspired by Strata tones
+    "highlight": "#C46565",  # Pulse inspired
+}
+
+STATUS_COLORS = {
+    "Planned": "#64A6D9",
+    "In Progress": "#8BC0B5",
+    "Done": "#0B1E41",
+    "On Hold": "#FADCCE",
+    "Holiday": "#C46565",
+}
+
+
+def inject_styles():
+    """Apply a modern layout and brand colors."""
+
+    st.markdown(
+        f"""
+        <style>
+        .main > div {{
+            background: linear-gradient(180deg, {PALETTE['background']} 0%, #F5F7FB 35%, #E9F2FF 100%);
+            color: #1B263B;
+        }}
+        .sidebar .sidebar-content {{
+            background: {PALETTE['primary']};
+        }}
+        .stButton button {{
+            background: {PALETTE['primary']};
+            color: {PALETTE['background']};
+            border-radius: 8px;
+            border: none;
+            padding: 0.5rem 1rem;
+            font-weight: 600;
+        }}
+        .stTabs [data-baseweb="tab"] {{
+            font-weight: 700;
+            color: {PALETTE['primary']};
+        }}
+        .metric-card {{
+            background: {PALETTE['background']};
+            border: 1px solid #E0E7F1;
+            padding: 1rem;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(11, 30, 65, 0.08);
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ---------- DB helpers ----------
@@ -86,6 +143,72 @@ def fetch_tasks(resource_id=None):
     rows = c.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def load_tasks_with_resources():
+    """Convenience helper returning tasks joined to resource metadata as a DataFrame."""
+
+    tasks = fetch_tasks()
+    if not tasks:
+        return pd.DataFrame()
+
+    tasks_df = pd.DataFrame(tasks)
+    resources = pd.DataFrame(fetch_resources(active_only=False))
+    if resources.empty:
+        return pd.DataFrame()
+
+    tasks_df = tasks_df.merge(
+        resources[["id", "name", "type", "color"]],
+        left_on="resource_id",
+        right_on="id",
+        how="left",
+        suffixes=("", "_res"),
+    )
+    tasks_df.rename(
+        columns={
+            "name": "resource_name",
+            "type": "resource_type",
+            "color": "resource_color",
+        },
+        inplace=True,
+    )
+    tasks_df["Start"] = pd.to_datetime(tasks_df["start_date"])
+    tasks_df["Finish"] = pd.to_datetime(tasks_df["end_date"])
+    return tasks_df
+
+
+def expand_tasks_to_calendar(tasks_df, start_filter=None, end_filter=None):
+    """Return a dataframe exploded into one row per resource per day within the window."""
+
+    if tasks_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, row in tasks_df.iterrows():
+        start = row["Start"]
+        end = row["Finish"]
+
+        if start_filter:
+            start = max(start, start_filter)
+        if end_filter:
+            end = min(end, end_filter)
+
+        if start > end:
+            continue
+
+        for dt in pd.date_range(start, end, freq="D"):
+            rows.append(
+                {
+                    "date": dt,
+                    "resource_id": row["resource_id"],
+                    "resource_name": row["resource_name"],
+                    "resource_type": row["resource_type"],
+                    "status": row["status"],
+                    "title": row["title"],
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
 def insert_resource(name, rtype, color):
@@ -368,8 +491,10 @@ def page_schedule():
         y="ResourceLabel",
         color="status",
         hover_data=["title", "description"],
+        color_discrete_map=STATUS_COLORS,
     )
     fig.update_yaxes(autorange="reversed")
+    fig.update_layout(plot_bgcolor=PALETTE["background"], paper_bgcolor=PALETTE["background"])
     st.plotly_chart(fig, use_container_width=True)
 
     # Task table
@@ -397,6 +522,185 @@ def page_schedule():
         st.session_state["task_form_mode"] = "edit"
         st.session_state["edit_task_id"] = int(edit_id)
         st.experimental_rerun()
+
+
+def page_dashboard():
+    st.header("Resource planning dashboard")
+
+    tasks_df = load_tasks_with_resources()
+    if tasks_df.empty:
+        st.info("Add resources and tasks to see dashboard insights.")
+        return
+
+    min_date = tasks_df["Start"].min().date()
+    max_date = tasks_df["Finish"].max().date()
+
+    st.subheader("Filters")
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        date_range = st.date_input(
+            "Date window",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+        )
+
+    with c2:
+        type_filter = st.multiselect(
+            "Resource types",
+            options=sorted(tasks_df["resource_type"].dropna().unique().tolist()),
+            default=sorted(tasks_df["resource_type"].dropna().unique().tolist()),
+        )
+
+    with c3:
+        status_filter = st.multiselect(
+            "Statuses",
+            options=list(STATUS_COLORS.keys()),
+            default=list(STATUS_COLORS.keys()),
+        )
+
+    if isinstance(date_range, tuple):
+        start_filter, end_filter = [pd.to_datetime(d) for d in date_range]
+    else:
+        start_filter = end_filter = pd.to_datetime(date_range)
+
+    tasks_df = tasks_df[
+        tasks_df["resource_type"].isin(type_filter)
+        & tasks_df["status"].isin(status_filter)
+    ]
+
+    if tasks_df.empty:
+        st.warning("No tasks in this filter. Try expanding the date range or filters above.")
+        return
+
+    calendar_df = expand_tasks_to_calendar(tasks_df, start_filter=start_filter, end_filter=end_filter)
+
+    # KPI cards
+    total_tasks = len(tasks_df)
+    active_resources = calendar_df["resource_name"].nunique()
+    busiest = (
+        calendar_df.groupby("resource_name")["date"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"date": "busy_days"})
+        .sort_values("busy_days", ascending=False)
+    )
+    most_busy_label = busiest.iloc[0]
+
+    st.subheader("Highlights")
+    kpi1, kpi2, kpi3 = st.columns(3)
+    with kpi1:
+        st.markdown(
+            f"""
+            <div class='metric-card'>
+                <div style='color:{PALETTE['primary']};text-transform:uppercase;font-size:12px;font-weight:700;'>Tasks</div>
+                <div style='font-size:32px;font-weight:800;'>{total_tasks}</div>
+                <div style='color:#4B5563;'>Scheduled in window</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with kpi2:
+        st.markdown(
+            f"""
+            <div class='metric-card'>
+                <div style='color:{PALETTE['primary']};text-transform:uppercase;font-size:12px;font-weight:700;'>Resources</div>
+                <div style='font-size:32px;font-weight:800;'>{active_resources}</div>
+                <div style='color:#4B5563;'>Active in this period</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with kpi3:
+        st.markdown(
+            f"""
+            <div class='metric-card'>
+                <div style='color:{PALETTE['primary']};text-transform:uppercase;font-size:12px;font-weight:700;'>Busiest</div>
+                <div style='font-size:24px;font-weight:800;'>{most_busy_label['resource_name']}</div>
+                <div style='color:#4B5563;'>{most_busy_label['busy_days']} busy days</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+
+    col_a, col_b = st.columns((2, 1))
+
+    with col_a:
+        st.subheader("Heat map: busy resources by week")
+        calendar_df["week"] = calendar_df["date"].dt.to_period("W").apply(lambda r: r.start_time.date())
+        heat_df = (
+            calendar_df.groupby(["resource_name", "week"])["date"]
+            .nunique()
+            .reset_index(name="busy_days")
+        )
+
+        heat_df["week_label"] = heat_df["week"].astype(str)
+
+        fig = px.density_heatmap(
+            heat_df,
+            x="week_label",
+            y="resource_name",
+            z="busy_days",
+            color_continuous_scale="Blues",
+            labels={"week_label": "Week starting", "resource_name": "Resource", "busy_days": "Busy days"},
+        )
+        fig.update_layout(
+            height=450,
+            plot_bgcolor=PALETTE["background"],
+            paper_bgcolor=PALETTE["background"],
+            xaxis_title="Week",
+            yaxis_title="",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_b:
+        st.subheader("Status mix")
+        status_summary = (
+            tasks_df.groupby("status")["id"].count().reset_index(name="count")
+        )
+        fig_status = px.pie(
+            status_summary,
+            names="status",
+            values="count",
+            color="status",
+            color_discrete_map=STATUS_COLORS,
+            hole=0.45,
+        )
+        fig_status.update_layout(plot_bgcolor=PALETTE["background"], paper_bgcolor=PALETTE["background"])
+        st.plotly_chart(fig_status, use_container_width=True)
+
+    st.markdown("---")
+
+    col_c, col_d = st.columns((1, 1))
+
+    with col_c:
+        st.subheader("Top busy resources")
+        st.dataframe(
+            busiest.rename(columns={"resource_name": "Resource", "busy_days": "Busy days"}),
+            use_container_width=True,
+        )
+
+    with col_d:
+        st.subheader("Upcoming tasks")
+        upcoming = tasks_df.sort_values("Start").head(10)
+        st.dataframe(
+            upcoming[["resource_name", "title", "status", "start_date", "end_date"]]
+            .rename(
+                columns={
+                    "resource_name": "Resource",
+                    "title": "Task",
+                    "status": "Status",
+                    "start_date": "Start",
+                    "end_date": "End",
+                }
+            ),
+            use_container_width=True,
+        )
 
 
 def page_resources():
@@ -542,17 +846,20 @@ def page_tasks_raw():
 # ---------- Main ----------
 
 def main():
-    st.set_page_config(page_title="Resource Scheduler", layout="wide")
+    st.set_page_config(page_title="Resource Scheduler", layout="wide", page_icon="📅")
+    inject_styles()
     ensure_session_state()
     init_db()
 
     st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Go to", ["Schedule", "Resources", "All tasks"])
+    page = st.sidebar.radio("Go to", ["Dashboard", "Schedule", "Resources", "All tasks"])
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Local-only demo app")
+    st.sidebar.caption("Resource planning toolkit")
 
-    if page == "Schedule":
+    if page == "Dashboard":
+        page_dashboard()
+    elif page == "Schedule":
         page_schedule()
     elif page == "Resources":
         page_resources()
