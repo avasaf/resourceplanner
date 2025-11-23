@@ -131,53 +131,77 @@ def init_db():
 
 
 def seed_demo_data():
-    """Seed the database with demo vessels, projects, people, and tasks if empty."""
+    """Seed the database with demo vessels, projects, people, and tasks in idempotent fashion."""
+
+    demo_resources = [
+        {"name": "Aurora Explorer", "type": "Vessel", "color": "#0B1E41"},
+        {"name": "Nordic Surveyor", "type": "Vessel", "color": "#64A6D9"},
+        {"name": "Project Polaris", "type": "Project", "color": "#8BC0B5"},
+        {"name": "Project Horizon", "type": "Project", "color": "#C46565"},
+        {"name": "Alex Morgan", "type": "Person", "color": "#0B1E41"},
+        {"name": "Sam Lee", "type": "Person", "color": "#64A6D9"},
+        {"name": "Priya Nair", "type": "Person", "color": "#8BC0B5"},
+    ]
+
+    demo_tasks = [
+        ("Aurora Explorer", "Cable lay - North Sea", "Laying subsea cables", "2025-01-04", "2025-01-15", "In Progress"),
+        ("Nordic Surveyor", "ROV inspection", "Inspection and survey", "2025-01-10", "2025-01-18", "Planned"),
+        ("Project Polaris", "Mobilisation", "Prep and mobilisation", "2025-01-05", "2025-01-08", "Planned"),
+        ("Project Polaris", "Execution phase", "Main work package", "2025-01-20", "2025-02-05", "In Progress"),
+        ("Project Horizon", "Design freeze", "Final design and sign-off", "2025-01-12", "2025-01-17", "On Hold"),
+        ("Alex Morgan", "Holiday", "Winter break", "2025-01-24", "2025-01-31", "Holiday"),
+        ("Alex Morgan", "Deck lead", "Oversee deck operations", "2025-02-10", "2025-02-22", "Planned"),
+        ("Sam Lee", "Time off", "Personal leave", "2025-02-03", "2025-02-07", "Time Off"),
+        ("Sam Lee", "Project Polaris support", "Site engineering", "2025-01-14", "2025-01-22", "In Progress"),
+        ("Priya Nair", "HSE training", "Annual certification", "2025-01-16", "2025-01-18", "Done"),
+        ("Priya Nair", "Project Horizon coordination", "PMO support", "2025-02-01", "2025-02-12", "Planned"),
+    ]
 
     conn = get_connection()
     c = conn.cursor()
 
-    c.execute("SELECT COUNT(*) FROM resources")
-    resource_count = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM tasks")
-    task_count = c.fetchone()[0]
-
-    if resource_count == 0:
-        sample_resources = [
-            ("Aurora Explorer", "Vessel", "#0B1E41"),
-            ("Nordic Surveyor", "Vessel", "#64A6D9"),
-            ("Project Polaris", "Project", "#8BC0B5"),
-            ("Project Horizon", "Project", "#C46565"),
-            ("Alex Morgan", "Person", "#0B1E41"),
-            ("Sam Lee", "Person", "#64A6D9"),
-            ("Priya Nair", "Person", "#8BC0B5"),
-        ]
-        c.executemany(
-            "INSERT INTO resources (name, type, color, active) VALUES (?, ?, ?, 1)",
-            sample_resources,
+    name_to_id = {}
+    for res in demo_resources:
+        c.execute(
+            "SELECT id FROM resources WHERE name = ? AND type = ?",
+            (res["name"], res["type"]),
         )
+        row = c.fetchone()
+        if row:
+            res_id = row[0]
+            c.execute(
+                "UPDATE resources SET active = 1, color = ? WHERE id = ?",
+                (res["color"], res_id),
+            )
+        else:
+            c.execute(
+                "INSERT INTO resources (name, type, color, active) VALUES (?, ?, ?, 1)",
+                (res["name"], res["type"], res.get("color")),
+            )
+            res_id = c.lastrowid
+        name_to_id[res["name"]] = res_id
 
-    if task_count == 0:
-        sample_tasks = [
-            (1, "Cable lay - North Sea", "Laying subsea cables", "2025-01-04", "2025-01-15", "In Progress"),
-            (2, "ROV inspection", "Inspection and survey", "2025-01-10", "2025-01-18", "Planned"),
-            (3, "Mobilisation", "Prep and mobilisation", "2025-01-05", "2025-01-08", "Planned"),
-            (3, "Execution phase", "Main work package", "2025-01-20", "2025-02-05", "In Progress"),
-            (4, "Design freeze", "Final design and sign-off", "2025-01-12", "2025-01-17", "On Hold"),
-            (5, "Holiday", "Winter break", "2025-01-24", "2025-01-31", "Holiday"),
-            (5, "Deck lead", "Oversee deck operations", "2025-02-10", "2025-02-22", "Planned"),
-            (6, "Time off", "Personal leave", "2025-02-03", "2025-02-07", "Time Off"),
-            (6, "Project Polaris support", "Site engineering", "2025-01-14", "2025-01-22", "In Progress"),
-            (7, "HSE training", "Annual certification", "2025-01-16", "2025-01-18", "Done"),
-            (7, "Project Horizon coordination", "PMO support", "2025-02-01", "2025-02-12", "Planned"),
-        ]
-
-        now = datetime.utcnow().isoformat()
-        c.executemany(
+    now = datetime.utcnow().isoformat()
+    for res_name, title, desc, start, end, status in demo_tasks:
+        res_id = name_to_id.get(res_name)
+        if not res_id:
+            continue
+        c.execute(
+            """
+            SELECT id FROM tasks
+            WHERE resource_id = ? AND title = ? AND start_date = ? AND end_date = ?
+            """,
+            (res_id, title, start, end),
+        )
+        exists = c.fetchone()
+        if exists:
+            continue
+        c.execute(
             """
             INSERT INTO tasks (resource_id, title, description, start_date, end_date, status, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [(*t, now, now) for t in sample_tasks],
+            (res_id, title, desc, start, end, status, now, now),
         )
 
     conn.commit()
@@ -229,25 +253,6 @@ def load_tasks_with_resources():
         return pd.DataFrame()
 
     tasks_df = pd.DataFrame(tasks)
-    resources = pd.DataFrame(fetch_resources(active_only=False))
-    if resources.empty:
-        return pd.DataFrame()
-
-    tasks_df = tasks_df.merge(
-        resources[["id", "name", "type", "color"]],
-        left_on="resource_id",
-        right_on="id",
-        how="left",
-        suffixes=("", "_res"),
-    )
-    tasks_df.rename(
-        columns={
-            "name": "resource_name",
-            "type": "resource_type",
-            "color": "resource_color",
-        },
-        inplace=True,
-    )
     tasks_df["Start"] = pd.to_datetime(tasks_df["start_date"])
     tasks_df["Finish"] = pd.to_datetime(tasks_df["end_date"])
     return tasks_df
@@ -306,6 +311,17 @@ def compute_utilization(calendar_df, start_filter, end_filter):
     utilization["available_days"] = total_days
     utilization["utilization"] = (utilization["busy_days"] / total_days * 100).round(1)
     return utilization.sort_values("utilization", ascending=False)
+
+
+def safe_unique(df, column):
+    """Safely return unique values even when duplicate column labels exist."""
+
+    if column not in df.columns:
+        return []
+    col = df.loc[:, [column]]
+    if isinstance(col, pd.DataFrame):
+        col = col.iloc[:, 0]
+    return sorted(pd.Series(col).dropna().unique().tolist())
 
 
 def insert_resource(name, rtype, color):
@@ -425,7 +441,7 @@ def page_schedule():
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        types = sorted(res_df["type"].unique().tolist())
+        types = safe_unique(res_df, "type")
         selected_types = st.multiselect("Resource types", types, default=types)
 
     with col2:
@@ -701,8 +717,8 @@ def page_dashboard():
     with c2:
         type_filter = st.multiselect(
             "Resource types",
-            options=sorted(tasks_df["resource_type"].dropna().unique().tolist()),
-            default=sorted(tasks_df["resource_type"].dropna().unique().tolist()),
+            options=safe_unique(tasks_df, "resource_type"),
+            default=safe_unique(tasks_df, "resource_type"),
         )
 
     with c3:
