@@ -24,7 +24,10 @@ STATUS_COLORS = {
     "Done": "#0B1E41",
     "On Hold": "#FADCCE",
     "Holiday": "#C46565",
+    "Time Off": "#C46565",
 }
+
+STATUS_OPTIONS = list(STATUS_COLORS.keys())
 
 
 def inject_styles():
@@ -48,6 +51,11 @@ def inject_styles():
             padding: 0.5rem 1rem;
             font-weight: 600;
         }}
+        .stButton button:hover {{
+            background: {PALETTE['accent']};
+            color: {PALETTE['primary']};
+            transition: all 0.2s ease-in-out;
+        }}
         .stTabs [data-baseweb="tab"] {{
             font-weight: 700;
             color: {PALETTE['primary']};
@@ -58,6 +66,20 @@ def inject_styles():
             padding: 1rem;
             border-radius: 12px;
             box-shadow: 0 8px 24px rgba(11, 30, 65, 0.08);
+        }}
+        .pill {{
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-weight: 700;
+            font-size: 12px;
+            color: {PALETTE['background']};
+        }}
+        .section-card {{
+            background: {PALETTE['background']};
+            border: 1px solid #E0E7F1;
+            border-radius: 14px;
+            padding: 1rem 1.25rem;
+            box-shadow: 0 10px 30px rgba(11, 30, 65, 0.06);
         }}
         </style>
         """,
@@ -103,6 +125,60 @@ def init_db():
             FOREIGN KEY(resource_id) REFERENCES resources(id)
         )
     """)
+
+    conn.commit()
+    conn.close()
+
+
+def seed_demo_data():
+    """Seed the database with demo vessels, projects, people, and tasks if empty."""
+
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(*) FROM resources")
+    resource_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM tasks")
+    task_count = c.fetchone()[0]
+
+    if resource_count == 0:
+        sample_resources = [
+            ("Aurora Explorer", "Vessel", "#0B1E41"),
+            ("Nordic Surveyor", "Vessel", "#64A6D9"),
+            ("Project Polaris", "Project", "#8BC0B5"),
+            ("Project Horizon", "Project", "#C46565"),
+            ("Alex Morgan", "Person", "#0B1E41"),
+            ("Sam Lee", "Person", "#64A6D9"),
+            ("Priya Nair", "Person", "#8BC0B5"),
+        ]
+        c.executemany(
+            "INSERT INTO resources (name, type, color, active) VALUES (?, ?, ?, 1)",
+            sample_resources,
+        )
+
+    if task_count == 0:
+        sample_tasks = [
+            (1, "Cable lay - North Sea", "Laying subsea cables", "2025-01-04", "2025-01-15", "In Progress"),
+            (2, "ROV inspection", "Inspection and survey", "2025-01-10", "2025-01-18", "Planned"),
+            (3, "Mobilisation", "Prep and mobilisation", "2025-01-05", "2025-01-08", "Planned"),
+            (3, "Execution phase", "Main work package", "2025-01-20", "2025-02-05", "In Progress"),
+            (4, "Design freeze", "Final design and sign-off", "2025-01-12", "2025-01-17", "On Hold"),
+            (5, "Holiday", "Winter break", "2025-01-24", "2025-01-31", "Holiday"),
+            (5, "Deck lead", "Oversee deck operations", "2025-02-10", "2025-02-22", "Planned"),
+            (6, "Time off", "Personal leave", "2025-02-03", "2025-02-07", "Time Off"),
+            (6, "Project Polaris support", "Site engineering", "2025-01-14", "2025-01-22", "In Progress"),
+            (7, "HSE training", "Annual certification", "2025-01-16", "2025-01-18", "Done"),
+            (7, "Project Horizon coordination", "PMO support", "2025-02-01", "2025-02-12", "Planned"),
+        ]
+
+        now = datetime.utcnow().isoformat()
+        c.executemany(
+            """
+            INSERT INTO tasks (resource_id, title, description, start_date, end_date, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [(*t, now, now) for t in sample_tasks],
+        )
 
     conn.commit()
     conn.close()
@@ -211,6 +287,27 @@ def expand_tasks_to_calendar(tasks_df, start_filter=None, end_filter=None):
     return pd.DataFrame(rows)
 
 
+def compute_utilization(calendar_df, start_filter, end_filter):
+    """Calculate busy days and utilization percentage per resource for a window."""
+
+    if calendar_df.empty:
+        return pd.DataFrame()
+
+    total_days = (end_filter.normalize() - start_filter.normalize()).days + 1
+    if total_days <= 0:
+        return pd.DataFrame()
+
+    utilization = (
+        calendar_df.groupby(["resource_id", "resource_name", "resource_type"])
+        ["date"]
+        .nunique()
+        .reset_index(name="busy_days")
+    )
+    utilization["available_days"] = total_days
+    utilization["utilization"] = (utilization["busy_days"] / total_days * 100).round(1)
+    return utilization.sort_values("utilization", ascending=False)
+
+
 def insert_resource(name, rtype, color):
     conn = get_connection()
     c = conn.cursor()
@@ -314,9 +411,18 @@ def page_schedule():
     res_df = pd.DataFrame(resources)
     res_df["label"] = res_df["type"] + " – " + res_df["name"]
 
+    tasks_all = fetch_tasks()
+    base_task_df = pd.DataFrame(tasks_all) if tasks_all else pd.DataFrame()
+    if not base_task_df.empty:
+        min_date = pd.to_datetime(base_task_df["start_date"]).min().date()
+        max_date = pd.to_datetime(base_task_df["end_date"]).max().date()
+    else:
+        min_date = date.today()
+        max_date = date.today()
+
     # Filters
     st.subheader("Filters")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         types = sorted(res_df["type"].unique().tolist())
@@ -332,9 +438,22 @@ def page_schedule():
     with col3:
         status_filter = st.multiselect(
             "Task status",
-            ["Planned", "In Progress", "Done", "On Hold", "Holiday"],
-            default=["Planned", "In Progress", "Done", "On Hold", "Holiday"],
+            STATUS_OPTIONS,
+            default=STATUS_OPTIONS,
         )
+
+    with col4:
+        date_range = st.date_input(
+            "Date range",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+        )
+
+    if isinstance(date_range, tuple):
+        start_filter, end_filter = [pd.to_datetime(d) for d in date_range]
+    else:
+        start_filter = end_filter = pd.to_datetime(date_range)
 
     # Filtered resources for task form
     st.subheader("Add / Edit Task")
@@ -354,10 +473,8 @@ def page_schedule():
     mode = st.session_state["task_form_mode"]
 
     if mode == "edit" and st.session_state["edit_task_id"]:
-        tasks_all = fetch_tasks()
         task_row = next((t for t in tasks_all if t["id"] == st.session_state["edit_task_id"]), None)
         if task_row:
-            # Find label for current resource
             default_res_label = res_df[res_df["id"] == task_row["resource_id"]]["label"].iloc[0]
             default_title = task_row["title"]
             default_desc = task_row["description"] or ""
@@ -371,14 +488,14 @@ def page_schedule():
             default_desc = ""
             default_start = date.today()
             default_end = date.today()
-            default_status = "Planned"
+            default_status = STATUS_OPTIONS[0]
     else:
         default_res_label = list(res_options.keys())[0]
         default_title = ""
         default_desc = ""
         default_start = date.today()
         default_end = date.today()
-        default_status = "Planned"
+        default_status = STATUS_OPTIONS[0]
 
     col_a, col_b = st.columns(2)
 
@@ -391,8 +508,8 @@ def page_schedule():
         title = st.text_input("Task title", value=default_title)
         status = st.selectbox(
             "Status",
-            ["Planned", "In Progress", "Done", "On Hold", "Holiday"],
-            index=["Planned", "In Progress", "Done", "On Hold", "Holiday"].index(default_status),
+            STATUS_OPTIONS,
+            index=STATUS_OPTIONS.index(default_status) if default_status in STATUS_OPTIONS else 0,
         )
 
     with col_b:
@@ -450,15 +567,11 @@ def page_schedule():
                 reset_task_form()
                 st.experimental_rerun()
 
-    # Load tasks for chart + table
-    tasks = fetch_tasks()
-    if not tasks:
+    if not tasks_all:
         st.info("No tasks yet. Add one above.")
         return
 
-    tasks_df = pd.DataFrame(tasks)
-
-    # Join resource label & type
+    tasks_df = pd.DataFrame(tasks_all)
     tasks_df = tasks_df.merge(
         res_df[["id", "label", "type"]],
         left_on="resource_id",
@@ -467,20 +580,20 @@ def page_schedule():
         suffixes=("", "_res"),
     )
     tasks_df.rename(columns={"label": "ResourceLabel", "type": "ResourceType"}, inplace=True)
+    tasks_df["Start"] = pd.to_datetime(tasks_df["start_date"])
+    tasks_df["Finish"] = pd.to_datetime(tasks_df["end_date"])
 
-    # Apply filters
     tasks_df = tasks_df[
-        tasks_df["ResourceType"].isin(selected_types) &
-        tasks_df["ResourceLabel"].isin(selected_res) &
-        tasks_df["status"].isin(status_filter)
+        (tasks_df["ResourceType"].isin(selected_types))
+        & (tasks_df["ResourceLabel"].isin(selected_res))
+        & (tasks_df["status"].isin(status_filter))
+        & (tasks_df["Start"] <= end_filter)
+        & (tasks_df["Finish"] >= start_filter)
     ]
 
     if tasks_df.empty:
         st.warning("No tasks match the current filters.")
         return
-
-    tasks_df["Start"] = pd.to_datetime(tasks_df["start_date"])
-    tasks_df["Finish"] = pd.to_datetime(tasks_df["end_date"])
 
     # Timeline chart
     st.subheader("Timeline")
@@ -497,7 +610,46 @@ def page_schedule():
     fig.update_layout(plot_bgcolor=PALETTE["background"], paper_bgcolor=PALETTE["background"])
     st.plotly_chart(fig, use_container_width=True)
 
-    # Task table
+    # Utilization and load summaries
+    st.subheader("Load snapshot")
+    calendar_df = expand_tasks_to_calendar(tasks_df, start_filter, end_filter)
+    util_df = compute_utilization(calendar_df, start_filter, end_filter)
+
+    col_util, col_heat = st.columns((1, 1))
+    with col_util:
+        if util_df.empty:
+            st.info("No workload in this window.")
+        else:
+            util_df_display = util_df.rename(
+                columns={
+                    "resource_name": "Resource",
+                    "resource_type": "Type",
+                    "busy_days": "Busy days",
+                    "available_days": "Days in window",
+                    "utilization": "Utilisation %",
+                }
+            )
+            st.dataframe(util_df_display, use_container_width=True)
+
+    with col_heat:
+        if not calendar_df.empty:
+            calendar_df["date_only"] = calendar_df["date"].dt.date
+            pivot = calendar_df.pivot_table(
+                index="resource_name",
+                columns="date_only",
+                values="title",
+                aggfunc="count",
+                fill_value=0,
+            )
+            fig_heat = px.imshow(
+                pivot,
+                aspect="auto",
+                labels={"x": "Date", "y": "Resource", "color": "# tasks"},
+                color_continuous_scale="Blues",
+            )
+            fig_heat.update_layout(height=350, plot_bgcolor=PALETTE["background"], paper_bgcolor=PALETTE["background"])
+            st.plotly_chart(fig_heat, use_container_width=True)
+
     st.subheader("Task list")
     display_cols = ["id", "ResourceLabel", "title", "status", "start_date", "end_date"]
     st.dataframe(
@@ -570,11 +722,17 @@ def page_dashboard():
         & tasks_df["status"].isin(status_filter)
     ]
 
+    tasks_df = tasks_df[
+        (tasks_df["Start"] <= end_filter) & (tasks_df["Finish"] >= start_filter)
+    ]
+
     if tasks_df.empty:
         st.warning("No tasks in this filter. Try expanding the date range or filters above.")
         return
 
     calendar_df = expand_tasks_to_calendar(tasks_df, start_filter=start_filter, end_filter=end_filter)
+    util_df = compute_utilization(calendar_df, start_filter, end_filter)
+    avg_utilisation = round(util_df["utilization"].mean(), 1) if not util_df.empty else 0
 
     # KPI cards
     total_tasks = len(tasks_df)
@@ -589,7 +747,7 @@ def page_dashboard():
     most_busy_label = busiest.iloc[0]
 
     st.subheader("Highlights")
-    kpi1, kpi2, kpi3 = st.columns(3)
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     with kpi1:
         st.markdown(
             f"""
@@ -621,6 +779,18 @@ def page_dashboard():
                 <div style='color:{PALETTE['primary']};text-transform:uppercase;font-size:12px;font-weight:700;'>Busiest</div>
                 <div style='font-size:24px;font-weight:800;'>{most_busy_label['resource_name']}</div>
                 <div style='color:#4B5563;'>{most_busy_label['busy_days']} busy days</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with kpi4:
+        st.markdown(
+            f"""
+            <div class='metric-card'>
+                <div style='color:{PALETTE['primary']};text-transform:uppercase;font-size:12px;font-weight:700;'>Avg utilisation</div>
+                <div style='font-size:32px;font-weight:800;'>{avg_utilisation}%</div>
+                <div style='color:#4B5563;'>Across filtered window</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -676,7 +846,47 @@ def page_dashboard():
 
     st.markdown("---")
 
-    col_c, col_d = st.columns((1, 1))
+    load_col, leave_col = st.columns((1, 1))
+
+    with load_col:
+        st.subheader("Workload by type")
+        workload_type = (
+            calendar_df.groupby("resource_type")["date"].nunique().reset_index(name="busy_days")
+        )
+        fig_type = px.bar(
+            workload_type,
+            x="resource_type",
+            y="busy_days",
+            color="resource_type",
+            color_discrete_sequence=[PALETTE["primary"], PALETTE["accent"], PALETTE["muted"]],
+            labels={"resource_type": "Type", "busy_days": "Busy days"},
+        )
+        fig_type.update_layout(plot_bgcolor=PALETTE["background"], paper_bgcolor=PALETTE["background"], showlegend=False)
+        st.plotly_chart(fig_type, use_container_width=True)
+
+    with leave_col:
+        st.subheader("Time off & holiday")
+        leave_df = tasks_df[tasks_df["status"].isin(["Holiday", "Time Off"])]
+        if leave_df.empty:
+            st.caption("No time off scheduled in this window.")
+        else:
+            st.dataframe(
+                leave_df[["resource_name", "title", "start_date", "end_date", "status"]]
+                .rename(
+                    columns={
+                        "resource_name": "Resource",
+                        "title": "Reason",
+                        "start_date": "Start",
+                        "end_date": "End",
+                        "status": "Type",
+                    }
+                ),
+                use_container_width=True,
+            )
+
+    st.markdown("---")
+
+    col_c, col_d, col_e = st.columns((1, 1, 1))
 
     with col_c:
         st.subheader("Top busy resources")
@@ -701,6 +911,25 @@ def page_dashboard():
             ),
             use_container_width=True,
         )
+
+    with col_e:
+        st.subheader("Watchlist (≥80% utilised)")
+        watchlist = util_df[util_df["utilization"] >= 80]
+        if watchlist.empty:
+            st.caption("No utilisation risks in this window.")
+        else:
+            st.dataframe(
+                watchlist[["resource_name", "resource_type", "busy_days", "utilization"]]
+                .rename(
+                    columns={
+                        "resource_name": "Resource",
+                        "resource_type": "Type",
+                        "busy_days": "Busy days",
+                        "utilization": "Utilisation %",
+                    }
+                ),
+                use_container_width=True,
+            )
 
 
 def page_resources():
@@ -850,6 +1079,7 @@ def main():
     inject_styles()
     ensure_session_state()
     init_db()
+    seed_demo_data()
 
     st.sidebar.title("Navigation")
     page = st.sidebar.radio("Go to", ["Dashboard", "Schedule", "Resources", "All tasks"])
