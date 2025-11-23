@@ -36,6 +36,12 @@ def inject_styles():
     st.markdown(
         f"""
         <style>
+        :root {{
+            --primary-color: {PALETTE['primary']};
+            --secondary-background-color: #F5F7FB;
+            --text-color: #1B263B;
+            --font: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+        }}
         .main > div {{
             background: linear-gradient(180deg, {PALETTE['background']} 0%, #F5F7FB 35%, #E9F2FF 100%);
             color: #1B263B;
@@ -43,6 +49,7 @@ def inject_styles():
         .sidebar .sidebar-content {{
             background: {PALETTE['primary']};
         }}
+        .sidebar .sidebar-content * {{ color: {PALETTE['background']}; }}
         .stButton button {{
             background: {PALETTE['primary']};
             color: {PALETTE['background']};
@@ -80,6 +87,24 @@ def inject_styles():
             border-radius: 14px;
             padding: 1rem 1.25rem;
             box-shadow: 0 10px 30px rgba(11, 30, 65, 0.06);
+        }}
+        /* Input focus and checkbox accents */
+        input, textarea, select, .stDateInput input {{
+            border-radius: 8px !important;
+        }}
+        .stDateInput > div > div > input:focus,
+        .stMultiSelect > div > div > input:focus,
+        .stTextInput > div > div > input:focus {{
+            border: 1px solid {PALETTE['accent']} !important;
+            box-shadow: 0 0 0 2px {PALETTE['accent']}22 !important;
+        }}
+        .st-multi-select__tag {{
+            background: {PALETTE['accent']}22 !important;
+            color: {PALETTE['primary']} !important;
+        }}
+        .stRadio > div[role="radiogroup"] label span {{
+            color: {PALETTE['primary']} !important;
+            font-weight: 600;
         }}
         </style>
         """,
@@ -292,6 +317,15 @@ def expand_tasks_to_calendar(tasks_df, start_filter=None, end_filter=None):
     return pd.DataFrame(rows)
 
 
+def ordered_resource_labels(res_df):
+    """Return labels grouped vessels -> projects -> people for tidy timelines."""
+
+    vessels = res_df[res_df["type"] == "Vessel"]["label"].tolist()
+    projects = res_df[res_df["type"] == "Project"]["label"].tolist()
+    people = res_df[res_df["type"] == "Person"]["label"].tolist()
+    return vessels + projects + people
+
+
 def compute_utilization(calendar_df, start_filter, end_filter):
     """Calculate busy days and utilization percentage per resource for a window."""
 
@@ -436,8 +470,8 @@ def page_schedule():
         min_date = date.today()
         max_date = date.today()
 
-    # Filters
-    st.subheader("Filters")
+    # Filters and zoom
+    st.subheader("Filters & zoom")
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
@@ -449,6 +483,7 @@ def page_schedule():
             "Resources",
             options=res_df["label"],
             default=res_df["label"],
+            help="Pick which vessels, projects or people to show",
         )
 
     with col3:
@@ -459,17 +494,35 @@ def page_schedule():
         )
 
     with col4:
+        zoom_choice = st.radio(
+            "Zoom",
+            options=["90 days", "6 months", "Full year", "Custom"],
+            horizontal=True,
+            index=1,
+        )
+
+    if zoom_choice == "Full year":
+        start_filter, end_filter = pd.to_datetime(min_date), pd.to_datetime(max_date)
+    elif zoom_choice == "90 days":
+        end_filter = pd.to_datetime(max_date)
+        start_filter = end_filter - pd.Timedelta(days=89)
+    elif zoom_choice == "6 months":
+        end_filter = pd.to_datetime(max_date)
+        start_filter = end_filter - pd.Timedelta(days=182)
+    else:
         date_range = st.date_input(
-            "Date range",
+            "Custom window",
             value=(min_date, max_date),
             min_value=min_date,
             max_value=max_date,
         )
+        if isinstance(date_range, tuple):
+            start_filter, end_filter = [pd.to_datetime(d) for d in date_range]
+        else:
+            start_filter = end_filter = pd.to_datetime(date_range)
 
-    if isinstance(date_range, tuple):
-        start_filter, end_filter = [pd.to_datetime(d) for d in date_range]
-    else:
-        start_filter = end_filter = pd.to_datetime(date_range)
+    start_filter = max(start_filter, pd.to_datetime(min_date))
+    end_filter = min(end_filter, pd.to_datetime(max_date))
 
     # Filtered resources for task form
     st.subheader("Add / Edit Task")
@@ -598,6 +651,10 @@ def page_schedule():
     tasks_df.rename(columns={"label": "ResourceLabel", "type": "ResourceType"}, inplace=True)
     tasks_df["Start"] = pd.to_datetime(tasks_df["start_date"])
     tasks_df["Finish"] = pd.to_datetime(tasks_df["end_date"])
+    tasks_df["TaskLabel"] = (
+        tasks_df.apply(lambda r: f"{r['title']} — {r['description'] or ''}".strip(" —"), axis=1)
+        .str.slice(0, 55)
+    )
 
     tasks_df = tasks_df[
         (tasks_df["ResourceType"].isin(selected_types))
@@ -613,17 +670,47 @@ def page_schedule():
 
     # Timeline chart
     st.subheader("Timeline")
+
+    ordered_labels = [lbl for lbl in ordered_resource_labels(res_df) if lbl in tasks_df["ResourceLabel"].unique()]
     fig = px.timeline(
         tasks_df,
         x_start="Start",
         x_end="Finish",
         y="ResourceLabel",
         color="status",
-        hover_data=["title", "description"],
+        text="TaskLabel",
+        custom_data=["title", "description", "start_date", "end_date", "status", "ResourceLabel"],
         color_discrete_map=STATUS_COLORS,
     )
-    fig.update_yaxes(autorange="reversed")
-    fig.update_layout(plot_bgcolor=PALETTE["background"], paper_bgcolor=PALETTE["background"])
+    fig.update_traces(
+        textposition="inside",
+        insidetextanchor="middle",
+        marker_line_color="#E0E7F1",
+        marker_line_width=1.2,
+        hovertemplate="<b>%{customdata[0]}</b><br>%{customdata[1]}<br>Start: %{customdata[2]}<br>End: %{customdata[3]}<br>Status: %{customdata[4]}<br>Resource: %{customdata[5]}",
+    )
+    fig.update_yaxes(
+        autorange="reversed",
+        showgrid=True,
+        gridcolor="#DCE4F2",
+        categoryorder="array",
+        categoryarray=ordered_labels,
+    )
+    fig.update_xaxes(
+        showgrid=True,
+        gridcolor="#DCE4F2",
+        dtick="M1",
+        tickformat="%b %d",
+        rangeslider_visible=True,
+        range=[start_filter, end_filter],
+    )
+    fig.update_layout(
+        height=520,
+        bargap=0.25,
+        plot_bgcolor=PALETTE["background"],
+        paper_bgcolor=PALETTE["background"],
+        legend_title_text="Status",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     # Utilization and load summaries
@@ -667,7 +754,15 @@ def page_schedule():
             st.plotly_chart(fig_heat, use_container_width=True)
 
     st.subheader("Task list")
-    display_cols = ["id", "ResourceLabel", "title", "status", "start_date", "end_date"]
+    display_cols = [
+        "id",
+        "ResourceLabel",
+        "title",
+        "description",
+        "status",
+        "start_date",
+        "end_date",
+    ]
     st.dataframe(
         tasks_df[display_cols].rename(columns={
             "id": "Task ID",
